@@ -15,6 +15,11 @@ set(JINX_NO_EXAMPLES ON)
 set(JINX_BUILD_DBUS ON)
 set(JINX_BUILD_USB ON)
 set(JINX_BUILD_OPENSSL ON)
+
+# Disable Result checking in Release to avoid _empty field issues
+if(CMAKE_BUILD_TYPE STREQUAL Release)
+    add_compile_definitions(JINX_RESULT_NO_CHECK)
+endif()
 add_subdirectory(jinx)
 add_subdirectory(asyncusb)
 add_subdirectory(asyncdbus)

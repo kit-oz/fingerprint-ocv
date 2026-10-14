@@ -327,13 +327,17 @@ protected:
         AsyncDBusMessage signal{
             dbus_message_new_signal(_dbus_path.c_str(), "net.reactivated.Fprint.Device", _verify ? "VerifyStatus" : "EnrollStatus")
         };
+        
         DBusMessageIter iter{};
         dbus_message_iter_init_append(signal, &iter);
         dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &status);
         dbus_message_iter_append_basic(&iter, DBUS_TYPE_BOOLEAN, &async_return);
-        return *this 
-            / _send_signal(_manager->get_dbus().get_connection(), signal) 
-            / ( async_return == TRUE ? &WorkerEnrollVerify::stop : &WorkerEnrollVerify::wait_image);
+        
+        auto next_step = async_return == TRUE ? &WorkerEnrollVerify::stop : &WorkerEnrollVerify::wait_image;
+        
+        return *this
+            / _send_signal(_manager->get_dbus().get_connection(), signal)
+            / next_step;
     }
 
     Async stop() {
@@ -803,18 +807,35 @@ protected:
 
         dbus_message_iter_get_basic(&args, &new_owner);
 
-        if (new_owner[0] == 0) {
-            syslog(LOG_AUTH | LOG_INFO, "disconnected");
-            if (_enroll_verify_task != nullptr) {
-                async_cancel(_enroll_verify_task) >> JINX_IGNORE_RESULT;
-                _enroll_verify_task.reset();
-            }
-            _claimed = false;
-            _claimed_sender.clear();
-            _claimed_user.clear();
-            return send_enroll_stop();
+        // Filter: only process NameOwnerChanged for our claimed sender's bus name
+        if (_claimed_sender.empty()) {
+            return run();
         }
 
+        // The 'name' argument is the unique bus name (e.g., ":1.2010")
+        if (name != _claimed_sender) {
+            return run();
+        }
+
+        if (new_owner[0] == 0) {
+            // D-Bus name was released - client (gnome-shell) disconnected
+            // When verify completes successfully (verify-match),
+            // gnome-shell releases its bus name before switching to login screen.
+            // The task is finishing its cleanup (stop() -> FPP_StopSensor).
+            // We must NOT interfere with this cleanup - just let it complete.
+            if (_enroll_verify_task != nullptr) {
+                // Do NOT reset _claimed, queues, or task here.
+                return run();
+            } else {
+                // No active task - safe to clean up state
+                _claimed = false;
+                _claimed_sender.clear();
+                _claimed_user.clear();
+            }
+            return run();
+        }
+
+        // new_owner is non-empty - client re-acquired the name
         return run();
     }
 
@@ -1135,7 +1156,22 @@ public:
         return *this;
     }
 
-protected:
+    Async handle_error(const error::Error& error) override {
+        auto state = AsyncRoutine::handle_error(error);
+        if (state != ControlState::Raise) {
+            return state;
+        }
+
+        // Handle SSL/TLS errors gracefully - don't crash on connection reset
+        if (error.category() == jinx::openssl::category_openssl()) {
+            _buffers.clear();
+            _buffer.reset();
+            return async_return();
+        }
+
+        return state;
+    }
+
     void async_finalize() noexcept override {
         _put_event.reset();
         _buffers.clear();
@@ -1196,8 +1232,8 @@ protected:
             event.len = ntohl(event.len);
             auto buffers = std::move(_buffers);
             _buffers.clear();
-            return *this 
-                / _put_event(_event_queue, FPCEvent{FPCEvent::FPC_Event, event, std::move(buffers)}) 
+            return *this
+                / _put_event(_event_queue, FPCEvent{FPCEvent::FPC_Event, event, std::move(buffers)})
                 / &TLSEventReader::read;
         }
     }
@@ -1267,18 +1303,14 @@ protected:
             return state;
         }
 
-        if (error.category() == jinx::usb::category_transfer()) {
-            if (static_cast<libusb_error>(error.value()) == LIBUSB_ERROR_NO_DEVICE) {
-                _event_queue->reset();
-                return async_return();
-            }
-        } else if (error.category() == jinx::usb::category_transfer()) {
-            if (static_cast<libusb_transfer_status>(error.value()) == LIBUSB_TRANSFER_NO_DEVICE) {
-                _event_queue->reset();
-                return async_return();
-            }
+        // Handle ALL USB errors gracefully - don't let them propagate
+        if (error.category() == jinx::usb::category_usb() ||
+            error.category() == jinx::usb::category_transfer()) {
+            _event_queue->reset();
+            return async_return();
         }
 
+        // For non-USB errors, rethrow
         return state;
     }
 

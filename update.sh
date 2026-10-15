@@ -27,15 +27,23 @@ fi
 echo "Остановка fprintd.service..."
 systemctl stop fprintd.service || true
 
-# Бэкап
-echo "Создание бэкапа..."
-cp "$INSTALL_PATH" "$BACKUP_PATH"
-echo "Бэкап: $BACKUP_PATH"
+# Бэкап (создаём только если бэкапа ещё нет)
+if [ ! -f "$BACKUP_PATH" ]; then
+    echo "Создание бэкапа..."
+    cp "$INSTALL_PATH" "$BACKUP_PATH"
+    echo "Бэкап: $BACKUP_PATH"
+else
+    echo "Бэкап уже существует: $BACKUP_PATH"
+fi
 
 # Копирование нового бинарника
 echo "Копирование нового бинарника..."
 cp "$BUILD_BIN" "$INSTALL_PATH"
 echo "Установлен: $INSTALL_PATH"
+
+# Перечитывание конфигурации systemd (в том числе fingerprint-ocv.service)
+echo "Перечитывание конфигурации systemd..."
+systemctl daemon-reload
 
 # Запуск сервиса
 echo "Запуск fprintd.service..."

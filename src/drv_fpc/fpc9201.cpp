@@ -28,6 +28,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <functional>
 #include <unistd.h>
 #include <vector>
 #include <list>
@@ -149,6 +150,7 @@ class WorkerEnrollVerify : public AsyncRoutine {
 
     bool _verify{};
     int _stage{};
+    std::function<void()> _on_finish{};
 
     Queue<std::queue<FPCEvent>>::Put _put_event{};
     Queue<std::queue<FPCEvent>>::Get _get_image{};
@@ -165,7 +167,8 @@ public:
         const std::string& name,
         const std::string& dbus_path,
         FingerprintStorage* storage,
-        bool verify
+        bool verify,
+        std::function<void()> on_finish
     ) {
         _manager = manager;
         _device_state = device_state;
@@ -180,6 +183,7 @@ public:
 
         _verify = verify;
         _stage = 0;
+        _on_finish = std::move(on_finish);
 
         syslog(LOG_AUTH | LOG_INFO, "%s start: %s/%s", _verify ? "verify" : "enroll", user.c_str(), name.c_str());
 
@@ -194,6 +198,10 @@ protected:
         _fingerprint._name.clear();
         _fingerprint._fingerprint.release();
         _fingerprint._mask.release();
+        if (_on_finish) {
+            auto on_finish = std::move(_on_finish);
+            on_finish();
+        }
         AsyncRoutine::async_finalize();
     }
 
@@ -472,10 +480,12 @@ class WorkerDevice : public AsyncDBusObject {
     std::string _dbus_path{};
 
     bool _claimed{};
+    bool _release_claim_pending{};
     std::string _claimed_sender{};
     std::string _claimed_user{};
 
     TaskPtr _enroll_verify_task{};
+    std::shared_ptr<bool> _verify_finished{};
     TaskPtr _name_owner_chaged_task{};
 
     std::string _device_name{};
@@ -487,6 +497,27 @@ class WorkerDevice : public AsyncDBusObject {
     AsyncDBusSend _send_message{};
     AsyncDBusSendWithReply _send_with_reply{};
     Queue<std::queue<FPCEvent>>::Put _put_image{};
+
+    void clear_claim() {
+        if (_name_owner_chaged_task != nullptr) {
+            _name_owner_chaged_task->resume({}) >> JINX_IGNORE_RESULT;
+            _name_owner_chaged_task.reset();
+        }
+        _claimed = false;
+        _claimed_sender.clear();
+        _claimed_user.clear();
+        _release_claim_pending = false;
+    }
+
+    void cleanup_finished_verify() {
+        if (_verify_finished != nullptr and *_verify_finished) {
+            _verify_finished.reset();
+            _enroll_verify_task.reset();
+            if (_release_claim_pending) {
+                clear_claim();
+            }
+        }
+    }
 
 public:
     WorkerDevice() = default;
@@ -564,6 +595,7 @@ protected:
             _name_owner_chaged_task->resume({}) >> JINX_IGNORE_RESULT;
             _name_owner_chaged_task.reset();
         }
+        _verify_finished.reset();
         AsyncDBusObject::async_finalize();
     }
 
@@ -807,6 +839,8 @@ protected:
 
         dbus_message_iter_get_basic(&args, &new_owner);
 
+        cleanup_finished_verify();
+
         // Filter: only process NameOwnerChanged for our claimed sender's bus name
         if (_claimed_sender.empty()) {
             return run();
@@ -824,13 +858,13 @@ protected:
             // The task is finishing its cleanup (stop() -> FPP_StopSensor).
             // We must NOT interfere with this cleanup - just let it complete.
             if (_enroll_verify_task != nullptr) {
-                // Do NOT reset _claimed, queues, or task here.
-                return run();
+                _release_claim_pending = true;
+                return *this
+                    / _put_image(_image_queue, FPCEvent{FPCEvent::FPP_EnrollVerifyStop, {}, {}})
+                    / &WorkerDevice::run;
             } else {
                 // No active task - safe to clean up state
-                _claimed = false;
-                _claimed_sender.clear();
-                _claimed_user.clear();
+                clear_claim();
             }
             return run();
         }
@@ -841,6 +875,7 @@ protected:
 
     Async claim() {
         auto& msg = get_message();
+        cleanup_finished_verify();
 
         if (_claimed) {
             AsyncDBusMessage reply{
@@ -875,6 +910,8 @@ protected:
     Async release() {
         auto& msg = get_message();
 
+        cleanup_finished_verify();
+
         if (_name_owner_chaged_task != nullptr) {
             _name_owner_chaged_task->resume({}) >> JINX_IGNORE_RESULT;
             _name_owner_chaged_task.reset();
@@ -888,6 +925,8 @@ protected:
         _claimed = false;
         _claimed_sender.clear();
         _claimed_user.clear();
+        _release_claim_pending = false;
+        _verify_finished.reset();
 
         AsyncDBusMessage reply{
             dbus_message_new_method_return(msg)
@@ -896,6 +935,7 @@ protected:
     }
 
     Async enroll_verify_start() {
+        cleanup_finished_verify();
         const char* method = dbus_message_get_member(get_message());
         bool is_verify = strcmp(method, "VerifyStart") == 0;
 
@@ -933,6 +973,8 @@ protected:
             return *this / _send_message(_connection, reply) / &WorkerDevice::run;
         }
 
+        _verify_finished = std::make_shared<bool>(false);
+        auto verify_finished = _verify_finished;
         _enroll_verify_task = task_new<WorkerEnrollVerify>(
             _manager, 
             &_device_state, 
@@ -942,7 +984,8 @@ protected:
             finger_name, 
             _dbus_path, 
             _storage,
-            is_verify);
+            is_verify,
+            [verify_finished]() { *verify_finished = true; });
 
         AsyncDBusMessage reply{
             dbus_message_new_method_return(get_message())
@@ -966,6 +1009,7 @@ protected:
 
     Async send_enroll_stop() {
         _enroll_verify_task.reset();
+        _verify_finished.reset();
         return *this / _put_image(_image_queue, FPCEvent{FPCEvent::FPP_EnrollVerifyStop, {}, {}}) / &WorkerDevice::run;
     }
 
@@ -1608,7 +1652,13 @@ protected:
             jinx_log_error() << "endpoint not found\n";
             return async_throw(make_error(LIBUSB_ERROR_NOT_FOUND));
         }
-        libusb_claim_interface(_handle, _interface.bInterfaceNumber);
+
+        int claim_ret = libusb_claim_interface(_handle, _interface.bInterfaceNumber);
+        if (claim_ret != 0) {
+            jinx_log_error() << "unable to claim USB interface: "
+                             << libusb_error_name(static_cast<libusb_error>(claim_ret)) << std::endl;
+            return async_throw(make_error(static_cast<libusb_error>(claim_ret)));
+        }
 
         // TODO cmd_get_unique_id
         device_unique_id = "fpc9201";
@@ -1634,10 +1684,6 @@ protected:
         libusb_device_handle* handle = _handle.get();
         unsigned char* data = &_control_buffer[LIBUSB_CONTROL_SETUP_SIZE];
 
-        printf("Version %d.%d.%d.%d\n", 
-            data[0], data[1], 
-            data[2], data[3]);
-        
         // 21.26.2.x
         if (data[0] != 21 || data[1] != 26 || data[2] != 2) {
             jinx_log_error() << "firmware version mismatch\n";
@@ -1651,8 +1697,8 @@ protected:
         data[1] = 0x2f;
         data[2] = 0x11;
         data[3] = 0x17;
-        return *this 
-            / _control_transfer(handle, _control_buffer, std::chrono::seconds(30)) 
+        return *this
+            / _control_transfer(handle, _control_buffer, std::chrono::seconds(30))
             / &WorkerControl::spawn;
     }
 
@@ -1823,7 +1869,6 @@ protected:
             fprintf(stderr, "bad aad failed\n");
             abort();
         }
-
         unsigned char sealing_key[SHA256_DIGEST_LENGTH];
         crypto::sha256("FPC_SEALING_KEY", 16, sealing_key);
 

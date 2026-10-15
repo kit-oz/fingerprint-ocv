@@ -105,6 +105,7 @@ int main(int argc, const char* argv[])
     AsyncUSB usb{eve};
 
     Manager manager{loop, dbus, usb, config};
+    manager.start();
 
     loop.run();
     return 0;
